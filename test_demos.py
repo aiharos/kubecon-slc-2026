@@ -128,6 +128,10 @@ class ModelRouting(unittest.TestCase):
                 self.assertEqual(body["choices"][0]["message"]["role"], "assistant")
                 self.assertEqual(body["choices"][0]["finish_reason"], "stop")
                 self.assertIn("MOCK", body["choices"][0]["message"]["content"])
+        for content_type in ["application/json; charset=utf-8", "application/json ; charset=utf-8"]:
+            with self.subTest(content_type=content_type):
+                status, _, raw = request(self.port, completion(), {"Content-Type": content_type})
+                self.assertEqual(status, 200, raw)
 
     def test_unusable_models_are_rejected(self):
         for payload in [{}, {"model": "unknown"}, {"model": None}, {"model": 8},
@@ -205,16 +209,15 @@ class ConsistentHashing(unittest.TestCase):
         before = {f"conversation-{i}": selected(f"conversation-{i}") for i in range(120)}
         self.assertEqual(set(before.values()), {"gpu-1", "gpu-2", "gpu-3"})
         self.assertEqual({key: selected(key) for key in before}, before)
-        Processes.stop(self.children["gpu-2"])
         canary = next(key for key, replica in before.items() if replica == "gpu-2")
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            status, headers, _ = request(self.port, completion(), {"X-Conversation-ID": canary})
-            if status == 200 and headers.get("x-mock-replica") != "gpu-2":
-                break
-            time.sleep(.1)
-        else:
-            self.fail("Health checks did not remove gpu-2 within 5 seconds")
+        Processes.stop(self.children["gpu-2"])
+        # Before health checks notice, redispatch must answer instead of stalling or failing.
+        started = time.monotonic()
+        status, headers, raw = request(self.port, completion(), {"X-Conversation-ID": canary})
+        self.assertEqual(status, 200, raw)
+        self.assertNotEqual(headers["x-mock-replica"], "gpu-2")
+        self.assertLess(time.monotonic() - started, 0.5)
+        time.sleep(1.5)  # inter 500ms, fall 2: let health checks drop gpu-2 from the ring.
         after = {key: selected(key) for key in before}
         self.assertNotIn("gpu-2", after.values())
         for key, replica in before.items():

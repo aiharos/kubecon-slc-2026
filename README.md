@@ -153,8 +153,10 @@ done
 Run **only the `kill PID` command printed by your launch block**, in another
 terminal, to stop its `gpu-2`. Wait about two seconds for health checks, then
 repeat the sample. Keys previously on `gpu-2` move to a survivor; the other
-assignments stay stable in this configuration. A request during failure
-detection can fail; hashing does not make an in-flight inference survive.
+assignments stay stable in this configuration. Before health checks notice,
+`option redispatch` sends a refused connection to a surviving replica instead
+of failing it. A request already in flight to the dying replica still fails;
+hashing does not make an in-flight inference survive.
 The automatic test checks this over 120 keys without manual PID handling.
 
 To restore the replica while HAProxy is still running, use another terminal:
@@ -171,6 +173,8 @@ restarted process separately with Ctrl-C; it is not owned by the original block.
 ```haproxy
 balance hdr(X-Conversation-ID)
 hash-type consistent
+retries 2
+option redispatch 1
 ```
 
 No stick table or per-conversation persistence state is required. Each server
