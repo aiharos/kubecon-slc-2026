@@ -1,6 +1,8 @@
 """Run real HAPEE processes and local mocks; no third-party packages required."""
 import contextlib
+import csv
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -29,6 +31,15 @@ def request(port, payload=None, headers=None, path="/v1/chat/completions"):
 
 def completion(model="llama-3.1-8b"):
     return {"model": model, "messages": [{"role": "user", "content": "Hello"}]}
+
+
+def backend_stats(port, backend):
+    """HAProxy's own `show stat` rows for one backend, keyed by server name."""
+    with socket.create_connection(("127.0.0.1", port), timeout=4) as sock:
+        sock.sendall(b"show stat\n")
+        raw = b"".join(iter(lambda: sock.recv(65536), b""))
+    rows = csv.DictReader(io.StringIO(raw.decode().lstrip("# ")))
+    return {row["svname"]: row for row in rows if row["pxname"] == backend}
 
 
 class Processes:
@@ -81,7 +92,7 @@ def start_demo(owner, name, servers, frontend):
     directory = processes.stack.enter_context(tempfile.TemporaryDirectory())
     # Reserve all selected ports together; release each only when its child starts.
     reservations = {}
-    for original in [frontend, *(port for port, _, _ in servers)]:
+    for original in [frontend, "stats", *(port for port, _, _ in servers)]:
         sock = processes.stack.enter_context(socket.socket())
         sock.bind(("127.0.0.1", 0))
         reservations[original] = sock
@@ -89,7 +100,11 @@ def start_demo(owner, name, servers, frontend):
     source = ROOT / name / "haproxy.cfg"
     if not source.is_file():
         raise AssertionError(f"Missing demo configuration: {source}")
-    config = source.read_text()
+    # Test-only stats socket: read server state from HAProxy instead of inferring it.
+    config = source.read_text().replace(
+        "global\n", "global\n    stats socket ipv4@127.0.0.1:stats\n", 1)
+    if "stats socket" not in config:
+        raise AssertionError(f"No global section to extend: {source}")
     for old, new in ports.items():
         config = config.replace(f"127.0.0.1:{old}", f"127.0.0.1:{new}")
     config_path = Path(directory) / "haproxy.cfg"
@@ -103,6 +118,7 @@ def start_demo(owner, name, servers, frontend):
             [sys.executable, str(ROOT / "mock_inference.py"), "--port", str(ports[port]),
              "--model", model, "--replica", replica], ports[port])
     reservations[frontend].close()
+    reservations["stats"].close()
     processes.start([HAPROXY, "-db", "-f", str(config_path)], ports[frontend])
     return ports[frontend], children, ports
 
@@ -210,15 +226,30 @@ class ConsistentHashing(unittest.TestCase):
         self.assertEqual(set(before.values()), {"gpu-1", "gpu-2", "gpu-3"})
         self.assertEqual({key: selected(key) for key in before}, before)
         canary = next(key for key, replica in before.items() if replica == "gpu-2")
+
+        def stats():
+            return backend_stats(self.ports["stats"], "gpu_replicas")
+
+        def redispatches():
+            return int(stats()["BACKEND"]["wredis"])
+
+        # gpu-2 must still be in the ring when it stops, or the canary proves nothing.
+        self.assertTrue(stats()["gpu-2"]["status"].startswith("UP"))
+        self.assertEqual(redispatches(), 0)
         Processes.stop(self.children["gpu-2"])
-        # Before health checks notice, redispatch must answer instead of stalling or failing.
-        started = time.monotonic()
-        status, headers, raw = request(self.port, completion(), {"X-Conversation-ID": canary})
-        self.assertEqual(status, 200, raw)
-        self.assertNotEqual(headers["x-mock-replica"], "gpu-2")
-        self.assertLess(time.monotonic() - started, 0.5)
-        time.sleep(1.5)  # inter 500ms, fall 2: let health checks drop gpu-2 from the ring.
+        # The first request to find gpu-2 gone is redispatched once, with no same-server
+        # retry, and its failed connect alone (not a health check) marks gpu-2 DOWN.
+        owner = selected(canary)
+        now = stats()
+        self.assertEqual(int(now["BACKEND"]["wredis"]), 1, "The canary missed the failure window")
+        self.assertEqual(int(now["BACKEND"]["wretr"]), 0)
+        self.assertEqual(now["gpu-2"]["status"], "DOWN")
+        self.assertEqual(int(now["gpu-2"]["hanafail"]), 1)
         after = {key: selected(key) for key in before}
+        # gpu-2 really left the ring: nothing after the canary needed a redispatch.
+        self.assertEqual(redispatches(), 1)
+        # One move, not two: the redispatched canary already reached its new ring owner.
+        self.assertEqual(after[canary], owner)
         self.assertNotIn("gpu-2", after.values())
         for key, replica in before.items():
             if replica != "gpu-2":
@@ -227,6 +258,17 @@ class ConsistentHashing(unittest.TestCase):
         self.assertEqual(moved, list(before.values()).count("gpu-2"))
         print(f"\nFailover: {moved}/{len(before)} conversations moved; surviving assignments stable.",
               flush=True)
+
+        # Without traffic, health checks alone must find a dead replica.
+        Processes.stop(self.children["gpu-3"])
+        deadline = time.monotonic() + 5
+        while stats()["gpu-3"]["status"] != "DOWN":
+            if time.monotonic() > deadline:
+                self.fail("Health checks did not remove gpu-3 within 5 seconds")
+            time.sleep(.1)
+        self.assertEqual(int(stats()["gpu-3"]["hanafail"]), 0)
+        self.assertEqual({selected(key) for key in before}, {"gpu-1"})
+        self.assertEqual(redispatches(), 1)
 
     def test_missing_or_blank_affinity_is_rejected(self):
         for headers in [{}, {"X-Conversation-ID": ""}, {"X-Conversation-ID": "   "}]:
