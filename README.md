@@ -36,7 +36,7 @@ replica, measure redistribution, and terminate only their own child processes.
 They can run while the manual demos are up. A configuration error or occupied
 port causes a test failure, not an attempt to stop another service.
 
-A successful run reports 12 tests and a line like:
+A successful run reports 13 tests and a line like:
 
 ```text
 Failover: 31/120 conversations moved; surviving assignments stable.

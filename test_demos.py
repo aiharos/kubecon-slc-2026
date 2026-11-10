@@ -144,10 +144,20 @@ class ModelRouting(unittest.TestCase):
                 self.assertEqual(body["choices"][0]["message"]["role"], "assistant")
                 self.assertEqual(body["choices"][0]["finish_reason"], "stop")
                 self.assertIn("MOCK", body["choices"][0]["message"]["content"])
-        for content_type in ["application/json; charset=utf-8", "application/json ; charset=utf-8"]:
+
+    def test_content_type_gate(self):
+        for content_type in ["application/json; charset=utf-8", "application/json ; charset=utf-8",
+                             "application/json\t;charset=utf-8", "Application/JSON"]:
             with self.subTest(content_type=content_type):
                 status, _, raw = request(self.port, completion(), {"Content-Type": content_type})
                 self.assertEqual(status, 200, raw)
+        for content_type in ["application/jsonp", "application/json-patch+json",
+                             "application/json charset=utf-8", "xapplication/json", "text/plain"]:
+            with self.subTest(content_type=content_type):
+                status, _, raw = request(self.port, completion(), {"Content-Type": content_type})
+                self.assertEqual(status, 415)
+                # The mock answers 415 too, with a JSON error; only the gateway's is empty.
+                self.assertEqual(raw, b"")
 
     def test_unusable_models_are_rejected(self):
         for payload in [{}, {"model": "unknown"}, {"model": None}, {"model": 8},
