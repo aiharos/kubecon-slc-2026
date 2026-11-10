@@ -151,11 +151,12 @@ done
 ```
 
 Run **only the `kill PID` command printed by your launch block**, in another
-terminal, to stop its `gpu-2`. Wait about two seconds for health checks, then
-repeat the sample. Keys previously on `gpu-2` move to a survivor; the other
-assignments stay stable in this configuration. Before health checks notice,
-`option redispatch` sends a refused connection to a surviving replica instead
-of failing it. A request already in flight to the dying replica still fails;
+terminal, to stop its `gpu-2`, then repeat the sample; no wait is needed. The
+first request that finds `gpu-2` refusing connections marks it DOWN and is
+retried on a surviving replica at once. Keys previously on `gpu-2` move once,
+straight to their new ring owner; the other assignments stay stable in this
+configuration. Without traffic, health checks remove a dead replica within
+about a second. A request already in flight to the dying replica still fails;
 hashing does not make an in-flight inference survive.
 The automatic test checks this over 120 keys without manual PID handling.
 
@@ -175,6 +176,8 @@ balance hdr(X-Conversation-ID)
 hash-type consistent
 retries 2
 option redispatch 1
+retry-on conn-failure
+default-server check inter 500ms fall 2 rise 1 observe layer4 error-limit 1 on-error mark-down
 ```
 
 No stick table or per-conversation persistence state is required. Each server
@@ -182,6 +185,17 @@ has an explicit stable `id` and equal weight. Keep identities, weights, hash
 settings and pool membership consistent across gateway instances if they must
 make the same choice. Consistent hashing limits movement; it neither guarantees
 an even split for a small key sample nor reacts to GPU load or queue depth.
+
+`option redispatch 1` retries a refused or timed-out connect on another replica
+immediately, and `retries 2` allows one retry for each other replica.
+`retry-on conn-failure` is the default, written out: only requests that never
+reached a replica are retried, so a POST is never replayed. `observe layer4
+error-limit 1 on-error mark-down` takes a replica out of the ring on its first
+failed connect instead of after two failed health checks, so the retried
+request already goes to the key's new ring owner and a conversation moves once
+rather than twice. The trade-off: a live replica that is too slow to accept
+within `timeout connect` also loses its conversations until its next successful
+health check.
 
 To compose both demos, keep model selection in the frontend and use consistent
 hashing *inside each model-specific backend*. Do not hash across servers that
@@ -214,7 +228,9 @@ serve different models and hope the selected server can handle the request.
   have no KV/prefix cache or conversation state. A hot key can overload a
   replica; failover does not transfer GPU state or guarantee a cache hit.
 - **Not a production gateway:** no auth, TLS, tenant isolation, rate limits,
-  Kubernetes discovery, readiness integration, or retry/idempotency policy.
+  Kubernetes discovery, readiness integration, or application-level
+  retry/idempotency policy. The hashing demo retries only connections that were
+  never established; it never replays a request a replica received.
   Health checks use the mock's `/health`, which is not an OpenAI API standard.
   HAProxy-generated error bodies are not uniformly OpenAI-style errors.
 - **Sovereignty and performance:** this demo's request path stays on the laptop.
